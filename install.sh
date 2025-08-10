@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
-# arch_install_caelestia.sh
-# WARNING: this script WILL WIPE DISK specified in DISK variable.
-# Read the script before running.
+set -u  # убрал pipefail, чтобы не прерывался из-за цепочек
 
 ### === CONFIG — редактируй аккуратно перед запуском === ###
 DISK="/dev/sda"                    # целевой диск — убедись!
@@ -24,6 +21,12 @@ INSTALL_NVIDIA_DKMS="yes"          # nvidia-dkms (рекомендуется д�
 # Where to clone Caelestia
 CAELESTIA_TARGET_DIR="/home/${USERNAME}/.config/quickshell/caelestia"
 
+# Функция для логирования и игнорирования ошибок
+run_cmd() {
+  echo ">>> Running: $*"
+  "$@" || echo "!!! Warning: команда '$*' завершилась с ошибкой, но установка продолжится."
+}
+
 ### === Ввод паролей интерактивно (в начале) === ###
 read -rsp "Root password (will be set non-interactively): " ROOT_PASS
 echo
@@ -37,14 +40,11 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "=== 1) Проверка интернета..."
-if ! ping -c3 8.8.8.8 &>/dev/null; then
-  echo "Проверка сети не пройдена. Подключитесь к сети и повторите." >&2
-  exit 2
-fi
+run_cmd ping -c3 8.8.8.8
 
 echo "=== 2) Обновление mirrorlist (reflector)..."
-pacman -Sy --noconfirm reflector || true
-reflector --country "Russia,Poland,Germany,Netherlands" --latest 20 --sort rate --protocol https --save /etc/pacman.d/mirrorlist || true
+run_cmd pacman -Sy --noconfirm reflector
+run_cmd reflector --country "Russia,Poland,Germany,Netherlands" --latest 20 --sort rate --protocol https --save /etc/pacman.d/mirrorlist
 
 echo "=== 3) Разметка диска: ${DISK} (GPT, EFI, ext4) ==="
 read -p "ВНИМАНИЕ: Это удалит все данные на ${DISK}. Продолжить? [type YES] " CONF
@@ -53,37 +53,40 @@ if [[ "$CONF" != "YES" ]]; then
   exit 3
 fi
 
-# Удаляем старую табл. разделов и создаём 2 раздела: EFI 512MiB и root ext4
-sgdisk --zap-all "${DISK}" || true
-parted -s "${DISK}" mklabel gpt || true
-parted -s "${DISK}" mkpart ESP fat32 1MiB 513MiB || true
-parted -s "${DISK}" set 1 boot on || true
-parted -s "${DISK}" mkpart primary ext4 513MiB 100% || true
+run_cmd sgdisk --zap-all "${DISK}"
+run_cmd parted -s "${DISK}" mklabel gpt
+run_cmd parted -s "${DISK}" mkpart ESP fat32 1MiB 513MiB
+run_cmd parted -s "${DISK}" set 1 boot on
+run_cmd parted -s "${DISK}" mkpart primary ext4 513MiB 100%
 
-# строим имена устройств (поддержка nvme: /dev/nvme0n1p1)
-EFI_PART="${DISK}1"
-ROOT_PART="${DISK}2"
+# Поддержка NVMe
+if [[ "${DISK}" == *"nvme"* ]]; then
+  EFI_PART="${DISK}p1"
+  ROOT_PART="${DISK}p2"
+else
+  EFI_PART="${DISK}1"
+  ROOT_PART="${DISK}2"
+fi
 
 echo "mkfs..."
-mkfs.fat -F32 "${EFI_PART}" || true
-mkfs.ext4 -F "${ROOT_PART}" || true
+run_cmd mkfs.fat -F32 "${EFI_PART}"
+run_cmd mkfs.ext4 -F "${ROOT_PART}"
 
 echo "монтирование..."
-mount "${ROOT_PART}" /mnt || true
+run_cmd mount "${ROOT_PART}" /mnt
 mkdir -p /mnt/boot
-mount "${EFI_PART}" /mnt/boot || true
+run_cmd mount "${EFI_PART}" /mnt/boot
 
 echo "=== 4) Установка базовой системы (pacstrap) ==="
-pacstrap /mnt base base-devel linux linux-headers linux-firmware intel-ucode \
-  vim git sudo networkmanager os-prober grub efibootmgr nano wget curl || true
+run_cmd pacstrap /mnt base base-devel linux linux-headers linux-firmware intel-ucode \
+  vim git sudo networkmanager os-prober grub efibootmgr nano wget curl
 
-genfstab -U /mnt >> /mnt/etc/fstab || true
+run_cmd genfstab -U /mnt >> /mnt/etc/fstab
 
 ### === 5) Входим в chroot и продолжаем автоматические шаги === ###
-# Создаём скрипт для chroot (без -e чтобы не прерываться)
 cat > /mnt/root/chroot_post.sh <<'CHROOT_SCRIPT'
 #!/usr/bin/env bash
-set -uo pipefail
+set -u
 
 DISK="DISK_PLACEHOLDER"
 HOSTNAME="HOSTNAME_PLACEHOLDER"
@@ -102,33 +105,38 @@ CAELESTIA_TARGET_DIR="CAELESTIA_TARGET_DIR_PLACEHOLDER"
 ROOT_PASS="ROOT_PASS_PLACEHOLDER"
 USER_PASS="USER_PASS_PLACEHOLDER"
 
+run_cmd() {
+  echo ">>> Running: $*"
+  "$@" || echo "!!! Warning: команда '$*' завершилась с ошибкой, но установка продолжится."
+}
+
 echo "=== chroot: timezone & locale ==="
-ln -sf /usr/share/zoneinfo/"${TIMEZONE}" /etc/localtime || true
-hwclock --systohc || true
+run_cmd ln -sf /usr/share/zoneinfo/"${TIMEZONE}" /etc/localtime
+run_cmd hwclock --systohc
 
-sed -i "s/^#\(${LOCALE1} UTF-8\)/\1/" /etc/locale.gen || true
-sed -i "s/^#\(${LOCALE2} UTF-8\)/\1/" /etc/locale.gen || true
-locale-gen || true
-echo "LANG=${LOCALE1}" > /etc/locale.conf || true
-echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf || true
+run_cmd sed -i "s/^#\(${LOCALE1} UTF-8\)/\1/" /etc/locale.gen
+run_cmd sed -i "s/^#\(${LOCALE2} UTF-8\)/\1/" /etc/locale.gen
+run_cmd locale-gen
+echo "LANG=${LOCALE1}" > /etc/locale.conf
+echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 
-echo "${HOSTNAME}" > /etc/hostname || true
+echo "${HOSTNAME}" > /etc/hostname
 cat > /etc/hosts <<EOF
 127.0.0.1	localhost
 ::1		localhost
 127.0.1.1	${HOSTNAME}.localdomain ${HOSTNAME}
 EOF
 
-echo "root:${ROOT_PASS}" | chpasswd || true
-useradd -m -G wheel -s /bin/bash "${USERNAME}" || true
-echo "${USERNAME}:${USER_PASS}" | chpasswd || true
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers || true
+run_cmd bash -c "echo root:${ROOT_PASS} | chpasswd"
+run_cmd useradd -m -G wheel -s /bin/bash "${USERNAME}"
+run_cmd bash -c "echo ${USERNAME}:${USER_PASS} | chpasswd"
+run_cmd sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
 echo "=== Настройка pacman.conf (ParallelDownloads=${PARALLEL_DOWNLOADS}) и multilib ==="
 if ! grep -q "^ParallelDownloads" /etc/pacman.conf; then
-  echo "ParallelDownloads = ${PARALLEL_DOWNLOADS}" >> /etc/pacman.conf || true
+  echo "ParallelDownloads = ${PARALLEL_DOWNLOADS}" >> /etc/pacman.conf
 else
-  sed -i "s/^ParallelDownloads.*/ParallelDownloads = ${PARALLEL_DOWNLOADS}/" /etc/pacman.conf || true
+  sed -i "s/^ParallelDownloads.*/ParallelDownloads = ${PARALLEL_DOWNLOADS}/" /etc/pacman.conf
 fi
 
 if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
@@ -138,101 +146,131 @@ Include = /etc/pacman.d/mirrorlist
 MULTILIB
 fi
 
-cp /etc/makepkg.conf /etc/makepkg.conf.bak || true
+run_cmd cp /etc/makepkg.conf /etc/makepkg.conf.bak
 if grep -q '^#MAKEFLAGS' /etc/makepkg.conf; then
-  sed -i "s|^#MAKEFLAGS=.*|MAKEFLAGS=\"-j${MAKEFLAGS_JOBS}\"|" /etc/makepkg.conf || true
+  sed -i "s|^#MAKEFLAGS=.*|MAKEFLAGS=\"-j${MAKEFLAGS_JOBS}\"|" /etc/makepkg.conf
 elif grep -q '^MAKEFLAGS' /etc/makepkg.conf; then
-  sed -i "s|^MAKEFLAGS=.*|MAKEFLAGS=\"-j${MAKEFLAGS_JOBS}\"|" /etc/makepkg.conf || true
+  sed -i "s|^MAKEFLAGS=.*|MAKEFLAGS=\"-j${MAKEFLAGS_JOBS}\"|" /etc/makepkg.conf
 else
-  echo "MAKEFLAGS=\"-j${MAKEFLAGS_JOBS}\"" >> /etc/makepkg.conf || true
+  echo "MAKEFLAGS=\"-j${MAKEFLAGS_JOBS}\"" >> /etc/makepkg.conf
 fi
 
-pacman -Syyu --noconfirm || true
+run_cmd pacman -Syyu --noconfirm
 
 if [ "${USE_CHAOTIC}" = "yes" ]; then
   echo "=== Подключаем Chaotic-AUR ==="
-  pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com || true
-  pacman-key --lsign-key 3056513887B78AEB || true
-  pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' || true
+  run_cmd pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com
+  run_cmd pacman-key --lsign-key 3056513887B78AEB
+  run_cmd pacman -U --noconfirm https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst
   if ! grep -q "^\[chaotic-aur\]" /etc/pacman.conf; then
     cat >> /etc/pacman.conf <<'CHAOTIC'
 [chaotic-aur]
 Include = /etc/pacman.d/chaotic-mirrorlist
 CHAOTIC
   fi
-  pacman -Syyu --noconfirm || true
+  run_cmd pacman -Syyu --noconfirm
 fi
 
 echo "=== Установка paru (AUR helper) ==="
-pacman -S --needed --noconfirm git base-devel || true
-cd /tmp || true
+run_cmd pacman -S --needed --noconfirm git base-devel
+cd /tmp || exit 1
 if ! command -v paru &>/dev/null; then
-  git clone https://aur.archlinux.org/paru.git || true
-  cd paru || true
-  makepkg -si --noconfirm || true
+  run_cmd git clone https://aur.archlinux.org/paru.git
+  cd paru || exit 1
+  run_cmd makepkg -si --noconfirm
 fi
 cd / || true
 
 if [ "${INSTALL_XANMOD}" = "yes" ]; then
   echo "=== Установка linux-xanmod из Chaotic/AUR ==="
-  pacman -S --noconfirm linux-xanmod linux-xanmod-headers || true
+  run_cmd pacman -S --noconfirm linux-xanmod linux-xanmod-headers
 fi
 
 if [ "${INSTALL_NVIDIA_DKMS}" = "yes" ]; then
   echo "=== Установка nvidia-dkms (рекомендуется) и 32-bit libs ==="
-  pacman -S --noconfirm nvidia-dkms nvidia-utils lib32-nvidia-utils || true
-  pacman -S --noconfirm vulkan-icd-loader lib32-vulkan-icd-loader vulkan-tools || true
+  run_cmd pacman -S --noconfirm nvidia-dkms nvidia-utils lib32-nvidia-utils
+  run_cmd pacman -S --noconfirm vulkan-icd-loader lib32-vulkan-icd-loader vulkan-tools
 fi
 
 echo "=== Установка игрового стека (steam, wine, lutris, mangohud, gamemode) ==="
-pacman -S --noconfirm steam lutris wine winetricks lib32-alsa-plugins lib32-libpulse gamemode mangohud lib32-mesa || true
-paru -S --noconfirm protonup-qt dxvk-bin vkd3d-proton lib32-vkd3d-proton || true
+run_cmd pacman -S --noconfirm steam lutris wine winetricks lib32-alsa-plugins lib32-libpulse gamemode mangohud lib32-mesa
+run_cmd paru -S --noconfirm protonup-qt dxvk-bin vkd3d-proton lib32-vkd3d-proton
 
 echo "=== Установка Hyprland + утилит ==="
-pacman -S --noconfirm hyprland wayland-protocols wlroots xorg-xwayland xdg-desktop-portal-gtk qt6-declarative \
+run_cmd pacman -S --noconfirm hyprland wayland-protocols wlroots xorg-xwayland xdg-desktop-portal-gtk qt6-declarative \
   pipewire pipewire-pulse pipewire-alsa pipewire-jack pamixer pavucontrol \
-  kitty cava cmatrix neofetch fastfetch btop grim swappy lm_sensors libqalculate || true
-paru -S --noconfirm ttf-material-symbols-variable-git ttf-jetbrains-mono-nerd || true
+  kitty cava cmatrix neofetch fastfetch btop grim swappy lm_sensors libqalculate
+run_cmd paru -S --noconfirm ttf-material-symbols-variable-git ttf-jetbrains-mono-nerd
 
 echo "=== Установка Quickshell (AUR) и Caelestia (клонируем конфиг и собираем beat_detector) ==="
-paru -S --noconfirm quickshell-git caelestia-cli-git caelestia-shell-git app2unit-git ddcutil brightnessctl cava aubio grim swappy || true
+run_cmd paru -S --noconfirm quickshell-git caelestia-cli-git caelestia-shell-git app2unit-git ddcutil brightnessctl cava aubio grim swappy
 
-mkdir -p "${CAELESTIA_TARGET_DIR}" || true
-chown -R "${USERNAME}:${USERNAME}" "$(dirname "${CAELESTIA_TARGET_DIR}")" || true
+run_cmd mkdir -p "${CAELESTIA_TARGET_DIR}"
+run_cmd chown -R "${USERNAME}:${USERNAME}" "$(dirname "${CAELESTIA_TARGET_DIR}")"
 
 cd /home/"${USERNAME}"/.config/quickshell || true
 if [ ! -d ".git" ]; then
-  git clone https://github.com/caelestia-dots/shell.git caelestia || true
+  run_cmd git clone https://github.com/caelestia-dots/shell.git caelestia
 fi
-chown -R "${USERNAME}:${USERNAME}" /home/"${USERNAME}"/.config/quickshell/caelestia || true
+run_cmd chown -R "${USERNAME}:${USERNAME}" /home/"${USERNAME}"/.config/quickshell/caelestia
 
-mkdir -p /usr/lib/caelestia || true
-chmod 755 /usr/lib/caelestia || true
-runuser -u "${USERNAME}" -- bash -lc "cd /home/${USERNAME}/.config/quickshell/caelestia && \
-  g++ -std=c++17 -Wall -Wextra -I/usr/include/pipewire-0.3 -I/usr/include/spa-0.2 -I/usr/include/aubio -o beat_detector assets/beat_detector.cpp -lpipewire-0.3 -laubio || true"
+run_cmd mkdir -p /usr/lib/caelestia
+run_cmd chmod 755 /usr/lib/caelestia
+run_cmd runuser -u "${USERNAME}" -- bash -lc "cd /home/${USERNAME}/.config/quickshell/caelestia && g++ -std=c++17 -Wall -Wextra -I/usr/include/pipewire-0.3 -I/usr/include/spa-0.2 -I/usr/include/aubio -o beat_detector assets/beat_detector.cpp -lpipewire-0.3 -laubio"
 
 if [ -f /home/"${USERNAME}"/.config/quickshell/caelestia/beat_detector ]; then
-  mv /home/"${USERNAME}"/.config/quickshell/caelestia/beat_detector /usr/lib/caelestia/beat_detector || true
-  chmod 755 /usr/lib/caelestia/beat_detector || true
+  run_cmd mv /home/"${USERNAME}"/.config/quickshell/caelestia/beat_detector /usr/lib/caelestia/beat_detector
+  run_cmd chmod 755 /usr/lib/caelestia/beat_detector
 fi
 
-mkdir -p /home/"${USERNAME}"/.config/caelestia || true
-cp -r /home/"${USERNAME}"/.config/quickshell/caelestia/config/* /home/"${USERNAME}"/.config/caelestia/ 2>/dev/null || true
-chown -R "${USERNAME}:${USERNAME}" /home/"${USERNAME}"/.config/caelestia /home/"${USERNAME}"/.config/quickshell/caelestia || true
+run_cmd mkdir -p /home/"${USERNAME}"/.config/caelestia
+run_cmd cp -r /home/"${USERNAME}"/.config/quickshell/caelestia/config/* /home/"${USERNAME}"/.config/caelestia/ 2>/dev/null
+run_cmd chown -R "${USERNAME}:${USERNAME}" /home/"${USERNAME}"/.config/caelestia /home/"${USERNAME}"/.config/quickshell/caelestia
 
-mkdir -p /home/"${USERNAME}"/.config/hypr || true
+run_cmd mkdir -p /home/"${USERNAME}"/.config/hypr
 cat > /home/"${USERNAME}"/.config/hypr/hyprland.conf <<HYPRCONF
 # minimal: autostart caelestia (qs is quickshell cli)
 exec-once = qs -c caelestia
 # you will want to replace or expand this hyprland conf later
 HYPRCONF
-chown -R "${USERNAME}:${USERNAME}" /home/"${USERNAME}"/.config/hypr || true
+run_cmd chown -R "${USERNAME}:${USERNAME}" /home/"${USERNAME}"/.config/hypr
 
-mkinitcpio -P || true
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB || true
-grub-mkconfig -o /boot/grub/grub.cfg || true
+run_cmd mkinitcpio -P
+run_cmd grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+run_cmd grub-mkconfig -o /boot/grub/grub.cfg
 
-systemctl enable NetworkManager || true
+run_cmd systemctl enable NetworkManager
 
 echo "=== chroot setup finished ==="
 CHROOT_SCRIPT
+
+# Подставляем реальные значения
+perl -0777 -pe "
+  s/DISK_PLACEHOLDER/${DISK}/g;
+  s/HOSTNAME_PLACEHOLDER/${HOSTNAME}/g;
+  s/USERNAME_PLACEHOLDER/${USERNAME}/g;
+  s/TIMEZONE_PLACEHOLDER/${TIMEZONE}/g;
+  s/LOCALE1_PLACEHOLDER/${LOCALE1}/g;
+  s/LOCALE2_PLACEHOLDER/${LOCALE2}/g;
+  s/KEYMAP_PLACEHOLDER/${KEYMAP}/g;
+  s/CPU_THREADS_PLACEHOLDER/${CPU_THREADS}/g;
+  s/PARALLEL_DOWNLOADS_PLACEHOLDER/${PARALLEL_DOWNLOADS}/g;
+  s/MAKEFLAGS_JOBS_PLACEHOLDER/${MAKEFLAGS_JOBS}/g;
+  s/USE_CHAOTIC_PLACEHOLDER/${USE_CHAOTIC}/g;
+  s/INSTALL_XANMOD_PLACEHOLDER/${INSTALL_XANMOD}/g;
+  s/INSTALL_NVIDIA_DKMS_PLACEHOLDER/${INSTALL_NVIDIA_DKMS}/g;
+  s/CAELESTIA_TARGET_DIR_PLACEHOLDER/$(echo ${CAELESTIA_TARGET_DIR} | sed 's/\\/\\\\/g')/g;
+  s/ROOT_PASS_PLACEHOLDER/$(echo ${ROOT_PASS} | sed "s/'/'\\\\''/g")/g;
+  s/USER_PASS_PLACEHOLDER/$(echo ${USER_PASS} | sed "s/'/'\\\\''/g")/g;
+" /mnt/root/chroot_post.sh > /mnt/root/chroot_post_filled.sh
+
+chmod +x /mnt/root/chroot_post_filled.sh
+arch-chroot /mnt /root/chroot_post_filled.sh
+
+# Чистим
+rm -f /mnt/root/chroot_post.sh /mnt/root/chroot_post_filled.sh
+
+echo "=== Установка завершена. Отмонтируем и перезагружаемся ==="
+run_cmd umount -R /mnt
+
+echo "Готово. Введите 'reboot' когда будете готовы."
